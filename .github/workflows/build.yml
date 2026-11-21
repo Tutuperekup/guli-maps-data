@@ -1,0 +1,63 @@
+name: Build map data
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml', 'scripts/**']
+  schedule:
+    - cron: '17 3 2 * *'   # 2-го числа каждого месяца
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: pmtiles CLI
+        run: |
+          gh release download --repo protomaps/go-pmtiles --pattern '*Linux_x86_64.tar.gz' --output pm.tgz
+          tar xzf pm.tgz pmtiles && sudo mv pmtiles /usr/local/bin/ && pmtiles version || true
+      - name: Latest Protomaps build
+        run: |
+          SRC=""
+          for i in $(seq 0 14); do
+            D=$(date -u -d "-$i day" +%Y%m%d)
+            if curl -sfI "https://build.protomaps.com/$D.pmtiles" >/dev/null; then SRC="https://build.protomaps.com/$D.pmtiles"; break; fi
+          done
+          test -n "$SRC" || { echo "no build found"; exit 1; }
+          echo "SRC=$SRC" >> $GITHUB_ENV; echo "Using $SRC"
+      - name: Extract regions
+        run: |
+          mkdir -p out
+          pmtiles extract "$SRC" out/tbilisi.pmtiles --bbox=44.62,41.62,45.06,41.87 --maxzoom=15
+          pmtiles extract "$SRC" out/georgia.pmtiles --bbox=39.85,40.95,46.85,43.70 --maxzoom=11
+          pmtiles extract "$SRC" out/batumi.pmtiles  --bbox=41.55,41.55,41.72,41.70 --maxzoom=15
+          pmtiles extract "$SRC" out/kutaisi.pmtiles --bbox=42.62,42.22,42.76,42.32 --maxzoom=15
+          ls -la out
+      - name: Map assets (renderer, style, fonts, sprites)
+        run: |
+          mkdir -p assets/lib work && cd work
+          npm pack maplibre-gl@5 pmtiles@4 @protomaps/basemaps@5 >/dev/null
+          for t in *.tgz; do mkdir -p "${t%.tgz}"; tar xzf "$t" -C "${t%.tgz}"; done
+          find . -path '*/dist/*' \( -name 'maplibre-gl.js' -o -name 'maplibre-gl.css' -o -name 'pmtiles.js' -o -name 'basemaps.js' \) | tee files.txt
+          while read f; do cp "$f" ../assets/lib/; done < files.txt
+          ls ../assets/lib
+          test -f ../assets/lib/maplibre-gl.js && test -f ../assets/lib/pmtiles.js && test -f ../assets/lib/basemaps.js
+          git clone --depth 1 https://github.com/protomaps/basemaps-assets ba
+          mkdir -p ../assets/fonts ../assets/sprites
+          for F in "Noto Sans Regular" "Noto Sans Medium" "Noto Sans Italic"; do cp -r "ba/fonts/$F" ../assets/fonts/; done
+          cp -r ba/sprites/v4 ../assets/sprites/
+          cd .. && python3 scripts/pack_assets.py assets out/assets.bin out/assets.json
+          (cd out && sha256sum * > SHA256SUMS && ls -la)
+          echo "$SRC" > out/SOURCE.txt
+      - name: Publish release
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest out/* --title "Map data $(date -u +%Y-%m-%d)" --notes "Source: $SRC. Map data © OpenStreetMap contributors, ODbL."
+      - name: Sync to app storage
+        run: |
+          sleep 20
+          curl -sS -m 900 "https://kartuli-ninuli.pages.dev/api/maps-sync" || true
